@@ -28,6 +28,7 @@ type OutgoingPromptMessage = {
 type IncomingMessage =
   | { t: 'start'; id: string }
   | { t: 'token'; id: string; tok: string }
+  | { t: 'reasoning_token'; id: string; tok: string }
   | { t: 'end'; id: string }
   | { t: 'error'; id: string; message: string }
   | { t: 'hello'; clientId?: string; impl?: string; version?: string }
@@ -147,17 +148,32 @@ function setupUI() {
   logView.style.whiteSpace = 'pre-wrap';
 
   const resultLabel = document.createElement('div');
-  resultLabel.textContent = 'Latest streamed completion:';
+  resultLabel.textContent = 'Latest streamed completion (assistant-visible):';
 
   const resultView = document.createElement('pre');
   resultView.id = 'result-view';
-  resultView.style.height = '160px';
+  resultView.style.height = '120px';
   resultView.style.overflow = 'auto';
   resultView.style.padding = '8px';
   resultView.style.border = '1px solid #e5e7eb';
   resultView.style.borderRadius = '4px';
   resultView.style.background = '#fefce8';
   resultView.style.whiteSpace = 'pre-wrap';
+
+  const reasoningLabel = document.createElement('div');
+  reasoningLabel.textContent = 'Latest streamed reasoning (hidden / internal):';
+
+  const reasoningView = document.createElement('pre');
+  reasoningView.id = 'reasoning-view';
+  reasoningView.style.height = '80px';
+  reasoningView.style.overflow = 'auto';
+  reasoningView.style.padding = '8px';
+  reasoningView.style.border = '1px solid #fee2e2';
+  reasoningView.style.borderRadius = '4px';
+  reasoningView.style.background = '#fff7ed';
+  reasoningView.style.whiteSpace = 'pre-wrap';
+  reasoningView.style.fontSize = '11px';
+  reasoningView.style.color = '#9f1239';
 
   root.appendChild(title);
   root.appendChild(roomRow);
@@ -168,6 +184,8 @@ function setupUI() {
   root.appendChild(logView);
   root.appendChild(resultLabel);
   root.appendChild(resultView);
+  root.appendChild(reasoningLabel);
+  root.appendChild(reasoningView);
 
   document.body.appendChild(root);
 }
@@ -194,10 +212,18 @@ function setResult(text: string) {
   el.scrollTop = el.scrollHeight;
 }
 
+function setReasoning(text: string) {
+  const el = document.getElementById('reasoning-view') as HTMLPreElement | null;
+  if (!el) return;
+  el.textContent = text;
+  el.scrollTop = el.scrollHeight;
+}
+
 let p2pcf: any | null = null;
 let currentPeer: any | null = null;
 let currentPromptId: string | null = null;
 let currentBuffer = '';
+let currentReasoningBuffer = '';
 
 function createClient(roomId: string) {
   const clientId = 'test-client';
@@ -305,8 +331,10 @@ function handleIncoming(msg: IncomingMessage) {
       }
       currentPromptId = msg.id;
       currentBuffer = '';
+      currentReasoningBuffer = '';
       appendLog(`Received start for id=${msg.id}`);
       setResult('');
+      setReasoning('');
       break;
 
     case 'token':
@@ -319,6 +347,19 @@ function handleIncoming(msg: IncomingMessage) {
       if (typeof msg.tok === 'string') {
         currentBuffer += msg.tok;
         setResult(currentBuffer);
+      }
+      break;
+
+    case 'reasoning_token':
+      if (!msg.id || msg.id !== currentPromptId) {
+        appendLog(
+          `Received reasoning_token for unknown/mismatched id=${msg.id} (current=${currentPromptId})`,
+        );
+        return;
+      }
+      if (typeof msg.tok === 'string') {
+        currentReasoningBuffer += msg.tok;
+        setReasoning(currentReasoningBuffer);
       }
       break;
 
