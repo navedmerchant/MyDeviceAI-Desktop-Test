@@ -3,35 +3,68 @@
  *
  * This runs in "MyDeviceAI-Desktop-Test" and acts as a remote peer that:
  * - Joins a P2PCF room.
- * - Sends { t: "prompt", id, prompt, max_tokens? } messages to the main app.
- * - Displays streamed { t: "start" | "token" | "end" | "error" } responses.
+ * - Exchanges hello and negotiates protocol version compatibility.
+ * - Sends { t: "prompt", id, messages: [{role, content}], max_tokens? } in OpenAI format.
+ * - Requests model info via { t: "get_model" }.
+ * - Displays streamed { t: "start" | "token" | "reasoning_token" | "end" | "error" } responses.
+ *
+ * Protocol Flow:
+ * 1. Connection: Both sides exchange "hello" messages
+ * 2. Version Negotiation: Client sends "version_negotiate", server responds with "version_ack"
+ * 3. Model Info: Client can request "get_model", server responds with "model_info"
+ * 4. Prompts: Client sends "prompt" with OpenAI-compatible messages array
+ * 5. Streaming: Server streams "start", "token"/"reasoning_token", and "end"/"error"
  *
  * Assumptions:
  * - Both apps use the same room ID convention (e.g. "room-XXXX").
  * - The main MyDeviceAI-Desktop app is already running and connected to the same room.
+ * - Protocol version 1.0.0 or compatible is supported by both sides.
  */
 
 import './index.css';
-// @ts-ignore - rely on runtime resolution
-import P2PCF from 'p2pcf';
+import { P2PCF } from './p2pcf/P2PCF';
 
 const LOG_PREFIX = '[TestApp]';
-const DEFAULT_ROOM_ID = 'room-test';
+const DEFAULT_ROOM_ID = 'CY5WRMY76';
+const PROTOCOL_VERSION = '1.0.0';
+const MIN_COMPATIBLE_VERSION = '1.0.0';
 
-type OutgoingPromptMessage = {
-  t: 'prompt';
-  id: string;
-  prompt: string;
-  max_tokens?: number;
+type Message = {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
 };
 
+type OutgoingMessage =
+  | {
+      t: 'hello';
+      clientId: string;
+      impl: string;
+      version: string;
+    }
+  | {
+      t: 'version_negotiate';
+      protocolVersion: string;
+      minCompatibleVersion: string;
+    }
+  | {
+      t: 'prompt';
+      id: string;
+      messages: Message[];
+      max_tokens?: number;
+    }
+  | {
+      t: 'get_model';
+    };
+
 type IncomingMessage =
+  | { t: 'hello'; clientId?: string; impl?: string; version?: string }
+  | { t: 'version_ack'; compatible: boolean; protocolVersion: string; reason?: string }
+  | { t: 'model_info'; id: string; displayName: string; installed: boolean }
   | { t: 'start'; id: string }
   | { t: 'token'; id: string; tok: string }
   | { t: 'reasoning_token'; id: string; tok: string }
   | { t: 'end'; id: string }
   | { t: 'error'; id: string; message: string }
-  | { t: 'hello'; clientId?: string; impl?: string; version?: string }
   | { t: string; [k: string]: any };
 
 function log(message: string, extra?: Record<string, unknown>): void {
@@ -96,15 +129,33 @@ function setupUI() {
   roomRow.appendChild(roomInput);
   roomRow.appendChild(connectBtn);
 
-  const promptLabel = document.createElement('div');
-  promptLabel.textContent =
-    'Prompt (will be sent as { t: "prompt", id, prompt, max_tokens }):';
+  const modelStatus = document.createElement('div');
+  modelStatus.id = 'model-status';
+  modelStatus.style.fontSize = '13px';
+  modelStatus.style.color = '#374151';
+  modelStatus.style.fontWeight = '500';
+  modelStatus.textContent = 'Model: (waiting for info...)';
 
-  const promptInput = document.createElement('textarea');
-  promptInput.id = 'prompt-input';
-  promptInput.rows = 4;
-  promptInput.style.width = '100%';
-  promptInput.placeholder = 'Ask something...';
+  const systemPromptLabel = document.createElement('div');
+  systemPromptLabel.textContent = 'System prompt (optional):';
+  systemPromptLabel.style.marginTop = '8px';
+
+  const systemPromptInput = document.createElement('textarea');
+  systemPromptInput.id = 'system-prompt-input';
+  systemPromptInput.rows = 2;
+  systemPromptInput.style.width = '100%';
+  systemPromptInput.placeholder = 'You are a helpful assistant...';
+  systemPromptInput.value = 'You are a helpful assistant.';
+
+  const userPromptLabel = document.createElement('div');
+  userPromptLabel.textContent =
+    'User message (will be sent as OpenAI-compatible messages array):';
+
+  const userPromptInput = document.createElement('textarea');
+  userPromptInput.id = 'user-prompt-input';
+  userPromptInput.rows = 4;
+  userPromptInput.style.width = '100%';
+  userPromptInput.placeholder = 'Ask something...';
 
   const controlsRow = document.createElement('div');
   controlsRow.style.display = 'flex';
@@ -127,9 +178,15 @@ function setupUI() {
   sendBtn.id = 'send-btn';
   sendBtn.disabled = true;
 
+  const getModelBtn = document.createElement('button');
+  getModelBtn.textContent = 'Get Model Info';
+  getModelBtn.id = 'get-model-btn';
+  getModelBtn.disabled = true;
+
   controlsRow.appendChild(maxTokensLabel);
   controlsRow.appendChild(maxTokensInput);
   controlsRow.appendChild(sendBtn);
+  controlsRow.appendChild(getModelBtn);
 
   const status = document.createElement('div');
   status.id = 'status';
@@ -177,8 +234,11 @@ function setupUI() {
 
   root.appendChild(title);
   root.appendChild(roomRow);
-  root.appendChild(promptLabel);
-  root.appendChild(promptInput);
+  root.appendChild(modelStatus);
+  root.appendChild(systemPromptLabel);
+  root.appendChild(systemPromptInput);
+  root.appendChild(userPromptLabel);
+  root.appendChild(userPromptInput);
   root.appendChild(controlsRow);
   root.appendChild(status);
   root.appendChild(logView);
@@ -224,37 +284,55 @@ let currentPeer: any | null = null;
 let currentPromptId: string | null = null;
 let currentBuffer = '';
 let currentReasoningBuffer = '';
+let isVersionNegotiated = false;
+let isCompatible = false;
+let currentModelInfo: { id: string; displayName: string; installed: boolean } | null = null;
 
 function createClient(roomId: string) {
   const clientId = 'test-client';
   appendLog(`Creating P2PCF client for room "${roomId}"`);
   log('Creating P2PCF client', { clientId, roomId });
 
-  const instance = new P2PCF(clientId, roomId);
+  const instance = new P2PCF(clientId, roomId, {
+    isDesktop: false,
+    workerUrl: 'https://p2pcf.naved-merchant.workers.dev'
+  });
 
   instance.on('peerconnect', (peer: any) => {
     currentPeer = peer;
+    isVersionNegotiated = false;
+    isCompatible = false;
     appendLog(
       `Peer connected: id=${peer?.id} client_id=${peer?.client_id ?? 'n/a'}`,
     );
-    setStatus('Connected to peer. Ready to send prompts.');
+    setStatus('Connected to peer. Negotiating protocol version...');
     log('Peer connected', {
       id: peer?.id,
       client_id: peer?.client_id,
     });
 
-    // Optional: send a hello message so the main app can log we are protocol-aware.
+    // Send hello message followed by version negotiation
     try {
-      const hello = {
+      const hello: OutgoingMessage = {
         t: 'hello',
         clientId,
         impl: 'mydeviceai-desktop-test',
         version: '1.0.0',
       };
-      peer.send(JSON.stringify(hello));
+      instance.send(peer, JSON.stringify(hello));
       appendLog('Sent hello message to peer');
+
+      // Immediately send version negotiation
+      const versionNegotiate: OutgoingMessage = {
+        t: 'version_negotiate',
+        protocolVersion: PROTOCOL_VERSION,
+        minCompatibleVersion: MIN_COMPATIBLE_VERSION,
+      };
+      instance.send(peer, JSON.stringify(versionNegotiate));
+      appendLog(`Sent version_negotiate: protocol=${PROTOCOL_VERSION}, minCompat=${MIN_COMPATIBLE_VERSION}`);
     } catch (err) {
-      logError('Failed to send hello', err as Error);
+      logError('Failed to send hello/version_negotiate', err as Error);
+      setStatus('Failed to negotiate protocol version', true);
     }
   });
 
@@ -265,6 +343,9 @@ function createClient(roomId: string) {
     setStatus('Peer disconnected. You may reconnect or wait for peer.');
     if (currentPeer === peer) {
       currentPeer = null;
+      isVersionNegotiated = false;
+      isCompatible = false;
+      currentModelInfo = null;
     }
   });
 
@@ -322,6 +403,51 @@ function handleIncoming(msg: IncomingMessage) {
       appendLog(
         `Received hello: impl=${msg.impl ?? ''} version=${msg.version ?? ''}`,
       );
+      break;
+
+    case 'version_ack':
+      isVersionNegotiated = true;
+      isCompatible = msg.compatible;
+      if (msg.compatible) {
+        appendLog(
+          `Version negotiation successful: server protocol=${msg.protocolVersion}`,
+        );
+        setStatus('Connected and ready. Protocol version compatible.');
+
+        // Request model info after successful version negotiation
+        if (p2pcf && currentPeer) {
+          try {
+            const getModel: OutgoingMessage = { t: 'get_model' };
+            p2pcf.send(currentPeer, JSON.stringify(getModel));
+            appendLog('Requested model info from server');
+          } catch (err) {
+            logError('Failed to request model info', err as Error);
+          }
+        }
+      } else {
+        appendLog(
+          `Version negotiation failed: ${msg.reason || 'incompatible versions'}`,
+        );
+        setStatus(
+          `Protocol version incompatible: ${msg.reason || 'server version mismatch'}`,
+          true,
+        );
+      }
+      break;
+
+    case 'model_info':
+      currentModelInfo = {
+        id: msg.id,
+        displayName: msg.displayName,
+        installed: msg.installed,
+      };
+      appendLog(
+        `Received model info: ${msg.displayName} (id=${msg.id}, installed=${msg.installed})`,
+      );
+      const modelStatus = document.getElementById('model-status');
+      if (modelStatus) {
+        modelStatus.textContent = `Model: ${msg.displayName} (${msg.installed ? 'installed' : 'not installed'})`;
+      }
       break;
 
     case 'start':
@@ -402,32 +528,55 @@ function sendPrompt() {
     return;
   }
 
-  const promptEl = document.getElementById(
-    'prompt-input',
+  if (!isVersionNegotiated) {
+    appendLog('Cannot send: version not negotiated yet');
+    setStatus('Waiting for protocol version negotiation...', true);
+    return;
+  }
+
+  if (!isCompatible) {
+    appendLog('Cannot send: protocol version incompatible');
+    setStatus('Cannot send: protocol version incompatible with server', true);
+    return;
+  }
+
+  const systemPromptEl = document.getElementById(
+    'system-prompt-input',
+  ) as HTMLTextAreaElement | null;
+  const userPromptEl = document.getElementById(
+    'user-prompt-input',
   ) as HTMLTextAreaElement | null;
   const maxTokensEl = document.getElementById(
     'max-tokens-input',
   ) as HTMLInputElement | null;
 
-  if (!promptEl || !maxTokensEl) {
-    appendLog('Prompt or max_tokens input missing from DOM');
+  if (!systemPromptEl || !userPromptEl || !maxTokensEl) {
+    appendLog('Required input elements missing from DOM');
     return;
   }
 
-  const prompt = promptEl.value.trim();
+  const systemPrompt = systemPromptEl.value.trim();
+  const userPrompt = userPromptEl.value.trim();
   const maxTokens = Number(maxTokensEl.value) || undefined;
 
-  if (!prompt) {
-    setStatus('Enter a prompt before sending.', true);
+  if (!userPrompt) {
+    setStatus('Enter a user message before sending.', true);
     return;
   }
 
   const id = `test-${Date.now().toString(36)}`;
 
-  const msg: OutgoingPromptMessage = {
+  // Build messages array in OpenAI format
+  const messages: Message[] = [];
+  if (systemPrompt) {
+    messages.push({ role: 'system', content: systemPrompt });
+  }
+  messages.push({ role: 'user', content: userPrompt });
+
+  const msg: OutgoingMessage = {
     t: 'prompt',
     id,
-    prompt,
+    messages,
   };
 
   if (maxTokens && maxTokens > 0) {
@@ -436,17 +585,43 @@ function sendPrompt() {
 
   try {
     const serialized = JSON.stringify(msg);
-    currentPeer.send(serialized);
+    p2pcf.send(currentPeer, serialized);
     appendLog(
-      `Sent prompt id=${id}, len=${prompt.length}, max_tokens=${msg.max_tokens ?? 'default'}`,
+      `Sent prompt id=${id}, messages=${messages.length}, max_tokens=${msg.max_tokens ?? 'default'}`,
     );
     setStatus('Prompt sent. Waiting for streamed tokens...');
     currentPromptId = id;
     currentBuffer = '';
+    currentReasoningBuffer = '';
     setResult('');
+    setReasoning('');
   } catch (err) {
     logError('Failed to send prompt over P2PCF', err as Error, { id });
     setStatus('Failed to send prompt over P2PCF.', true);
+  }
+}
+
+function getModelInfo() {
+  if (!p2pcf || !currentPeer) {
+    appendLog('Cannot get model info: no connected peer');
+    setStatus('Cannot get model info: not connected to any peer.', true);
+    return;
+  }
+
+  if (!isVersionNegotiated || !isCompatible) {
+    appendLog('Cannot get model info: version not negotiated or incompatible');
+    setStatus('Waiting for protocol version negotiation...', true);
+    return;
+  }
+
+  try {
+    const getModel: OutgoingMessage = { t: 'get_model' };
+    p2pcf.send(currentPeer, JSON.stringify(getModel));
+    appendLog('Requested model info from server');
+    setStatus('Model info request sent...');
+  } catch (err) {
+    logError('Failed to send get_model', err as Error);
+    setStatus('Failed to send model info request', true);
   }
 }
 
@@ -462,8 +637,11 @@ window.addEventListener('DOMContentLoaded', () => {
   const sendBtn = document.getElementById(
     'send-btn',
   ) as HTMLButtonElement | null;
+  const getModelBtn = document.getElementById(
+    'get-model-btn',
+  ) as HTMLButtonElement | null;
 
-  if (!connectBtn || !roomInput || !sendBtn) {
+  if (!connectBtn || !roomInput || !sendBtn || !getModelBtn) {
     logError('Missing core UI elements; cannot initialize test app');
     return;
   }
@@ -486,10 +664,15 @@ window.addEventListener('DOMContentLoaded', () => {
     setStatus(`Connecting to room "${roomId}"...`);
     p2pcf = createClient(roomId);
     sendBtn.disabled = false;
+    getModelBtn.disabled = false;
   };
 
   sendBtn.onclick = () => {
     sendPrompt();
+  };
+
+  getModelBtn.onclick = () => {
+    getModelInfo();
   };
 
   // Optional: auto-connect to DEFAULT_ROOM_ID on load for convenience.
